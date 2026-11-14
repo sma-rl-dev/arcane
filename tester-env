@@ -1,0 +1,360 @@
+#!/usr/bin/env bash
+# tester-env CLI for Arcane (getarcaneapp/arcane v2.17.3).
+#
+# Deploys Arcane from editable source in Docker, with NO Docker daemon access:
+# no /var/run/docker.sock mount, no privileged container, no dind. The app boots
+# and serves its DB-backed surfaces (users, roles, API keys, webhooks,
+# templates, variables, registries, git repos, settings, notifications); the
+# Docker inventory pages will show connection errors by design.
+#
+# Ports/state:
+#   host port ${PORT:-3552} -> container 3552
+#   named volume  ${DATA_VOLUME} -> /app/data (SQLite DB + projects + git storage)
+#
+# Deterministic credentials:
+#   initial  arcane / arcane-admin      (upstream first-boot default, forced change)
+#   final    arcane / Tester-env-Password-123   (set automatically by deploy)
+#   seeded   mara.chen, dylan.ortiz, priya.raman, tobias.fenn, sana.okafor
+#            all with Tester-env-Password-123 (see `./tester-env seed`)
+#
+# All commands accept --run-id <id> and --port <port> because scripts/rl-env
+# invokes them that way. RUN_ID scopes containers/volumes only; IMAGE_TAG scopes
+# the image.
+set -euo pipefail
+
+SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+COMPOSE_FILE="$SCRIPT_DIR/docker-compose.tester-env.yml"
+
+RUN_ID="${RUN_ID:-}"
+PORT="${PORT:-3552}"
+IMAGE_NAME="${IMAGE_TAG:-tester-env-arcane:dev}"
+
+SUFFIX=""
+[ -n "$RUN_ID" ] && SUFFIX="-$RUN_ID"
+PROJECT_NAME="tester-env-arcane${SUFFIX}"
+CONTAINER_NAME="tester-env-arcane${SUFFIX}"
+DATA_VOLUME="arcane-data${SUFFIX}"
+
+APP_URL="${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+LOCAL_URL="http://127.0.0.1:${PORT}"
+
+ADMIN_USER="arcane"
+ADMIN_INITIAL_PASSWORD="arcane-admin"
+ADMIN_PASSWORD="${ARCANE_FINAL_ADMIN_PASSWORD:-Tester-env-Password-123}"
+ENCRYPTION_KEY="${ENCRYPTION_KEY:-3JDIgolks2tJ9ymm1AdqzlYMWu0DUWyt}"
+JWT_SECRET="${JWT_SECRET:-tester-env-arcane-jwt-secret-fixed-value-0001}"
+ADMIN_STATIC_API_KEY="${ADMIN_STATIC_API_KEY:-arc_testerenvstaticadminkey0000000000}"
+
+log() { printf '==> %s\n' "$*"; }
+die() { printf '==> ERROR: %s\n' "$*" >&2; exit 1; }
+
+compose() {
+  IMAGE_TAG="$IMAGE_NAME" \
+  CONTAINER_NAME="$CONTAINER_NAME" \
+  DATA_VOLUME="$DATA_VOLUME" \
+  PORT="$PORT" \
+  APP_URL="$APP_URL" \
+  ENCRYPTION_KEY="$ENCRYPTION_KEY" \
+  JWT_SECRET="$JWT_SECRET" \
+  ADMIN_STATIC_API_KEY="$ADMIN_STATIC_API_KEY" \
+  docker compose -p "$PROJECT_NAME" -f "$COMPOSE_FILE" "$@"
+}
+
+need_docker() {
+  command -v docker >/dev/null 2>&1 || die "docker is required"
+}
+
+json_get() {
+  # json_get <json> <dotted.path> -> raw value or empty
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    value = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for part in sys.argv[1].split("."):
+    if isinstance(value, list):
+        try:
+            value = value[int(part)]
+            continue
+        except (ValueError, IndexError):
+            sys.exit(0)
+    if not isinstance(value, dict) or part not in value:
+        sys.exit(0)
+    value = value[part]
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is not None:
+    print(value)
+' "$2"
+}
+
+setting_value() {
+  # setting_value <settings-list-json> <key> -> value or empty
+  printf '%s' "$1" | python3 -c '
+import json, sys
+try:
+    payload = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+items = payload if isinstance(payload, list) else (payload.get("data") or [])
+for item in items:
+    if isinstance(item, dict) and item.get("key") == sys.argv[1]:
+        print(item.get("value"))
+        break
+' "$2"
+}
+
+http_status() {
+  # http_status <method> <path> [json-body] [credential]
+  local method="$1" path="$2" body="${3:-}" cred="${4:-}"
+  local args=(-sS -o /dev/null -w '%{http_code}' -X "$method" "${LOCAL_URL}${path}")
+  [ -n "$cred" ] && args+=(-H "$(_auth_header "$cred")")
+  [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+  curl "${args[@]}" 2>/dev/null || true
+}
+
+http_body() {
+  # http_body <method> <path> [json-body] [credential]
+  local method="$1" path="$2" body="${3:-}" cred="${4:-}"
+  local args=(-sS -X "$method" "${LOCAL_URL}${path}")
+  [ -n "$cred" ] && args+=(-H "$(_auth_header "$cred")")
+  [ -n "$body" ] && args+=(-H 'Content-Type: application/json' -d "$body")
+  curl "${args[@]}" 2>/dev/null || true
+}
+
+_auth_header() {
+  case "$1" in
+    arc_*) printf 'X-API-Key: %s' "$1" ;;
+    *) printf 'Authorization: Bearer %s' "$1" ;;
+  esac
+}
+
+login_token() {
+  # login_token <password> -> access token or empty
+  local password="$1" body
+  body=$(http_body POST /api/auth/login "$(printf '{"username":"%s","password":"%s"}' "$ADMIN_USER" "$password")")
+  json_get "$body" data.token
+}
+
+wait_for_health() {
+  local deadline=$((SECONDS + 180))
+  log "waiting for /api/health on ${LOCAL_URL}"
+  while [ $SECONDS -lt $deadline ]; do
+    if [ "$(http_status GET /api/health)" = "200" ]; then
+      log "health: UP"
+      return 0
+    fi
+    if ! docker ps --filter "name=^/${CONTAINER_NAME}$" --format '{{.Names}}' | grep -q .; then
+      docker logs --tail 40 "$CONTAINER_NAME" 2>&1 || true
+      die "container ${CONTAINER_NAME} exited before health check passed"
+    fi
+    sleep 2
+  done
+  docker logs --tail 60 "$CONTAINER_NAME" 2>&1 || true
+  die "health check did not pass within 180s"
+}
+
+ensure_admin_password() {
+  # $1 = fresh (1 when the data volume did not exist before this deploy)
+  local fresh="$1" token status
+  if [ "$fresh" != "1" ]; then
+    token=$(login_token "$ADMIN_PASSWORD")
+    if [ -n "$token" ]; then
+      log "admin login already uses the deterministic final password"
+      return 0
+    fi
+  fi
+
+  # The static admin API key authenticates as the default admin without going
+  # through /auth/login (which is rate limited per IP). Use it to set the
+  # documented final password and clear the forced first-login change.
+  log "setting deterministic admin password"
+  status=$(http_status POST /api/auth/password \
+    "$(printf '{"currentPassword":"%s","newPassword":"%s"}' "$ADMIN_INITIAL_PASSWORD" "$ADMIN_PASSWORD")" "$ADMIN_STATIC_API_KEY")
+  if [ "$status" != "200" ]; then
+    # Already changed on an earlier deploy but the login probe above failed for
+    # another reason (e.g. rate limit): fall back to the final password.
+    status=$(http_status POST /api/auth/password \
+      "$(printf '{"currentPassword":"%s","newPassword":"%s"}' "$ADMIN_PASSWORD" "$ADMIN_PASSWORD")" "$ADMIN_STATIC_API_KEY")
+    [ "$status" = "200" ] || die "password change failed with HTTP ${status}"
+  fi
+  log "admin password set to the documented final password"
+}
+
+disable_background_polling() {
+  local status
+  status=$(http_status PUT /api/environments/0/settings \
+    '{"pollingEnabled":"false","autoUpdate":"false"}' "$ADMIN_STATIC_API_KEY")
+  [ "$status" = "200" ] || die "failed to disable polling settings (HTTP ${status})"
+  log "image polling and auto-update disabled in settings"
+}
+
+cmd_deploy() {
+  need_docker
+  local fresh=0
+  docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1 || fresh=1
+  log "image ${IMAGE_NAME}"
+  log "container ${CONTAINER_NAME} (project ${PROJECT_NAME}) port ${PORT}"
+  compose up -d --build --remove-orphans
+  wait_for_health
+  ensure_admin_password "$fresh"
+  disable_background_polling
+  log "Arcane is up: ${APP_URL}"
+  log "login: ${ADMIN_USER} / ${ADMIN_PASSWORD}"
+}
+
+cmd_reset() {
+  need_docker
+  log "stopping ${CONTAINER_NAME} and removing volume ${DATA_VOLUME}"
+  compose down -v --remove-orphans >/dev/null 2>&1 || true
+  docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+  if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
+    docker volume rm "$DATA_VOLUME" >/dev/null 2>&1 || die "cannot remove volume ${DATA_VOLUME}"
+  fi
+  log "reset complete (image ${IMAGE_NAME} preserved)"
+}
+
+cmd_stop() {
+  need_docker
+  log "stopping ${CONTAINER_NAME} (data volume preserved)"
+  compose stop >/dev/null
+  log "stopped"
+}
+
+cmd_seed() {
+  # Deterministic, idempotent fixture for the DB-backed (daemon-free) domain.
+  # The bootstrap that every scenario may rely on (admin login, polling off)
+  # happens in deploy; seed only adds domain records.
+  log "seeding deterministic Arcane fixtures (users, roles, API keys, templates, variables, registries, git repos, webhooks, notifications)"
+  TESTER_ENV_LOCAL_URL="$LOCAL_URL" \
+  ADMIN_STATIC_API_KEY="$ADMIN_STATIC_API_KEY" \
+  TESTER_ENV_SEED_PASSWORD="$ADMIN_PASSWORD" \
+    python3 "$SCRIPT_DIR/scripts/tester-env-seed.py"
+}
+
+cmd_verify() {
+  need_docker
+  local health status token me settings
+  health=$(http_status GET /api/health)
+  [ "$health" = "200" ] || die "/api/health returned HTTP ${health}"
+
+  token=$(login_token "$ADMIN_PASSWORD")
+  [ -n "$token" ] || die "admin login failed for ${ADMIN_USER}"
+
+  status=$(http_status GET /api/auth/me "" "$token")
+  [ "$status" = "200" ] || die "/api/auth/me returned HTTP ${status}"
+  me=$(http_body GET /api/auth/me "" "$token")
+  [ "$(json_get "$me" data.username)" = "$ADMIN_USER" ] || die "unexpected current user in /api/auth/me"
+  [ "$(json_get "$me" data.requiresPasswordChange)" != "true" ] || die "admin still requires a password change"
+
+  status=$(http_status GET "/api/users?limit=1" "" "$token")
+  [ "$status" = "200" ] || die "DB-backed /api/users returned HTTP ${status}"
+
+  status=$(http_status GET /api/environments/0/settings "" "$token")
+  [ "$status" = "200" ] || die "DB-backed /api/environments/0/settings returned HTTP ${status}"
+  settings=$(http_body GET /api/environments/0/settings "" "$token")
+  [ "$(setting_value "$settings" pollingEnabled)" = "false" ] || die "pollingEnabled is not false"
+
+  log "verify OK: health 200, login as ${ADMIN_USER}, polling disabled, DB-backed endpoints 200"
+
+  # Seeded-data assertions (runs after seed; fails loudly on a partial seed).
+  TESTER_ENV_LOCAL_URL="$LOCAL_URL" \
+  ADMIN_STATIC_API_KEY="$ADMIN_STATIC_API_KEY" \
+  TESTER_ENV_SEED_PASSWORD="$ADMIN_PASSWORD" \
+    python3 "$SCRIPT_DIR/scripts/tester-env-verify.py"
+}
+
+cmd_status() {
+  need_docker
+  local state health port
+  if docker inspect "$CONTAINER_NAME" >/dev/null 2>&1; then
+    state=$(docker inspect -f '{{.State.Status}}' "$CONTAINER_NAME")
+    health=$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$CONTAINER_NAME")
+    port=$(docker port "$CONTAINER_NAME" 3552/tcp 2>/dev/null | head -1 || true)
+    log "container: ${CONTAINER_NAME} (${state}, health ${health}) port ${port:-unknown}"
+  else
+    log "container: ${CONTAINER_NAME} not created"
+  fi
+  if docker volume inspect "$DATA_VOLUME" >/dev/null 2>&1; then
+    log "volume: ${DATA_VOLUME} present"
+  else
+    log "volume: ${DATA_VOLUME} absent"
+  fi
+  log "image: ${IMAGE_NAME}"
+  log "url: ${LOCAL_URL} (browser origin ${APP_URL})"
+  log "login: ${ADMIN_USER} / ${ADMIN_PASSWORD}"
+}
+
+cmd_logs() {
+  need_docker
+  docker logs -f --tail=200 "$CONTAINER_NAME"
+}
+
+usage() {
+  cat <<EOF
+Usage: ./tester-env <command> [--run-id ID] [--port PORT]
+
+Commands:
+  deploy   Build the image from source, start the container, wait for health,
+           set the deterministic admin password and disable background polling.
+  reset    Remove the container and its data volume (image is preserved).
+  stop     Stop the container, preserving the data volume.
+  seed     Idempotently create the deterministic Northwind Labs fixtures
+           (users, custom roles, API keys, templates, variables, registries,
+           git repositories, updater webhooks, notification channels).
+  verify   Assert health, admin login, DB settings and the full seeded state
+           (including one seeded Viewer login and its enforced role).
+  status   Show container/volume state, URL and credentials.
+  logs     Follow container logs.
+  help     This message.
+
+Environment:
+  IMAGE_TAG    Image name (default tester-env-arcane:dev; scripts/rl-env sets
+               a content-addressed tag)
+  RUN_ID       Scopes container/volume names only
+  PORT         Host port (default 3552)
+  TESTER_ENV_BROWSER_ORIGIN  APP_URL for the SPA (default http://localhost:PORT)
+
+Daemon-free: no /var/run/docker.sock mount, no privileged mode, no dind.
+EOF
+}
+
+main() {
+  local command=""
+  local positional=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --run-id) RUN_ID="${2:-}"; shift 2 ;;
+      --run-id=*) RUN_ID="${1#*=}"; shift ;;
+      --port) PORT="${2:-}"; shift 2 ;;
+      --port=*) PORT="${1#*=}"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) positional+=("$1"); shift ;;
+    esac
+  done
+  command="${positional[0]:-help}"
+
+  SUFFIX=""
+  [ -n "$RUN_ID" ] && SUFFIX="-$RUN_ID"
+  PROJECT_NAME="tester-env-arcane${SUFFIX}"
+  CONTAINER_NAME="tester-env-arcane${SUFFIX}"
+  DATA_VOLUME="arcane-data${SUFFIX}"
+  APP_URL="${TESTER_ENV_BROWSER_ORIGIN:-http://localhost:${PORT}}"
+  LOCAL_URL="http://127.0.0.1:${PORT}"
+  [ -n "${IMAGE_TAG:-}" ] && IMAGE_NAME="$IMAGE_TAG"
+
+  case "$command" in
+    deploy) cmd_deploy ;;
+    reset) cmd_reset ;;
+    stop) cmd_stop ;;
+    seed) cmd_seed ;;
+    verify) cmd_verify ;;
+    status) cmd_status ;;
+    logs) cmd_logs ;;
+    help) usage ;;
+    *) usage >&2; exit 2 ;;
+  esac
+}
+
+main "$@"

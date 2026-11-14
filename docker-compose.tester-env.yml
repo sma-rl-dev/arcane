@@ -1,0 +1,50 @@
+# tester-env deployment for Arcane (daemon-free mode).
+#
+# Built and driven by ./tester-env. Every value that the CLI exports is
+# referenced explicitly here so `docker compose config` shows the effective
+# configuration.
+#
+# There is deliberately NO /var/run/docker.sock mount and no privileged
+# container: Arcane must boot and serve its DB-backed surfaces with no Docker
+# daemon. DOCKER_HOST points at a socket that does not exist inside the
+# container so the lazy Docker client fails fast instead of silently reaching
+# the host daemon.
+services:
+  arcane:
+    image: ${IMAGE_TAG:-tester-env-arcane:dev}
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.tester-env
+    container_name: ${CONTAINER_NAME:-tester-env-arcane}
+    restart: "no"
+    ports:
+      - "${PORT:-3552}:3552"
+    environment:
+      APP_URL: ${APP_URL:-http://localhost:3552}
+      TZ: UTC
+      PUID: "65532"
+      PGID: "65532"
+      PROJECTS_DIRECTORY: /app/data/projects
+      TEMPLATES_DIRECTORY: /app/data/templates
+      DATABASE_URL: "file:data/arcane.db?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_txlock=immediate"
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY:-3JDIgolks2tJ9ymm1AdqzlYMWu0DUWyt}
+      JWT_SECRET: ${JWT_SECRET:-tester-env-arcane-jwt-secret-fixed-value-0001}
+      ADMIN_STATIC_API_KEY: ${ADMIN_STATIC_API_KEY:-arc_testerenvstaticadminkey0000000000}
+      UPDATE_CHECK_DISABLED: "true"
+      ANALYTICS_DISABLED: "true"
+      DOCKER_HOST: "unix:///app/data/no-docker-daemon.sock"
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    volumes:
+      - arcane-data:/app/data
+    cgroup: host
+    healthcheck:
+      test: ["CMD", "./arcane", "health", "--timeout", "2s"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 20s
+    stop_grace_period: 15s
+
+volumes:
+  arcane-data:
+    name: ${DATA_VOLUME:-arcane-data}
