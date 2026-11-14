@@ -233,3 +233,39 @@ verification from `/settings/users`.
 
 The image is intentionally preserved (`docker images` may be shared with other
 in-flight runs); reclaim with `scripts/rl-env gc --prune-images`.
+
+## Fork baseline and submodule proof (2026-11-14)
+
+- Canonical fork: `https://github.com/sma-rl-dev/arcane` (created with
+  `gh repo fork https://github.com/getarcaneapp/arcane --org sma-rl-dev
+  --remote=false`; parent `getarcaneapp/arcane`).
+- Branch `tester-env-baseline`: `852aa10fe658b4ed61f8b3e51484236c171c292a`
+  (v2.17.3) plus commit `142e10f8998795de3a68dfdf388f82c92fecae11`
+  ("tester-env: add daemon-free deployment CLI, seed and verify for v2.17.3").
+  No upstream application source is modified on this branch.
+- Corpus submodule: `apps/arcane` → `https://github.com/sma-rl-dev/arcane.git`,
+  branch `tester-env-baseline`. The pinned commit in `status/apps/arcane.toml`
+  is the tip of this branch and includes this evidence section.
+
+Proof executed from a fresh clone of the fork at `apps/arcane` (not from the
+prospect checkout), 2026-11-14, run id `forkproof`, port `3563`,
+`IMAGE_TAG=tester-env-arcane:forkproof`:
+
+```bash
+./tester-env reset    # compose -p tester-env-arcane-forkproof down -v; volume absent afterwards
+./tester-env deploy   # docker compose up -d --build from this checkout; health UP;
+                      # deterministic admin password set; polling/auto-update disabled
+./tester-env seed     # Northwind Labs fixtures created
+./tester-env verify   # exit 0: bootstrap checks + all seeded-state assertions
+./tester-env seed     # idempotent: unchanged records, no duplicates
+./tester-env reset    # container + volume removed, image preserved
+```
+
+`docker build -f docker/Dockerfile.tester-env` from the same checkout also
+succeeded (BuildKit reported cached layers, identifying the source-built image
+from the identical tree). Runtime inspection of the running container:
+`Privileged=false`, mounts only `arcane-data-forkproof:/app/data`, no
+`/var/run/docker.sock` bind, `DOCKER_HOST=unix:///app/data/no-docker-daemon.sock`,
+`UPDATE_CHECK_DISABLED=true`, `ANALYTICS_DISABLED=true`. The pre-existing
+`tester-env-arcane` container on port 3552 and all shared browser containers
+were left untouched.
